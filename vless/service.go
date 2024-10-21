@@ -3,6 +3,7 @@ package vless
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -35,6 +36,14 @@ type poolUnit struct {
 	ipmap map[netip.Addr]*ipunit //TODO: use sync.Map instead of mutex
 	maxlogin int
 	poolaccsess sync.RWMutex
+	downlink *sAtomic.Int64
+	uplink *sAtomic.Int64
+
+	maxlimit int
+	disabled bool
+
+	bandwidthlimiterdisabled bool
+
 }
 // test func
 func (p *poolUnit) startchecker() {
@@ -57,10 +66,18 @@ func (s *Service[T]) Startchecker() {
 	for {
 		time.Sleep(500 * time.Millisecond)
 		for _, punit  := range s.poolMap {
+			if (punit.downlink.Load()/(1024*1024))>= int64(punit.maxlimit) && !punit.disabled && !punit.bandwidthlimiterdisabled{
+				fmt.Println("here")
+				punit.poolaccsess.Lock()
+				punit.disabled = true	
+				punit.poolaccsess.Unlock()
+			}
 			if len(punit.ipmap) == 0 {
 				continue
 			}
+			fmt.Println(punit.downlink.Load()/ (1024*1024))
 			for ip, unit := range punit.ipmap {
+				//fmt.Printf("%v ", unit.count.Load())
 				if unit.count.Load() == 0 {
 					punit.poolaccsess.Lock()
 					delete(punit.ipmap, ip)
@@ -110,6 +127,11 @@ func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowLi
 			ipmap: make(map[netip.Addr]*ipunit, mxlogin),
 			maxlogin: mxlogin,
 			poolaccsess: sync.RWMutex{},
+			downlink: new(sAtomic.Int64),
+			uplink: new(sAtomic.Int64),
+			maxlimit: 10,
+			disabled: false,
+			bandwidthlimiterdisabled: true,
 		}
 		//go poolmap[userID].startchecker()
 
@@ -141,6 +163,11 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 
 
 	poolun := s.poolMap[request.UUID]
+	//fmt.Println(*poolun)
+	if poolun.disabled {
+		fmt.Println("bandwidth limit hit")
+		return E.New("Bandwidth limititation hit closing connections")
+	}
 	ipunitt, loaded := poolun.ipmap[metadata.Source.Addr]
 	if !loaded && len(poolun.ipmap) >= poolun.maxlogin {
 		s.logger.Error("ip pool already filled new connection from diffrent ips rejected ", metadata.Source.Addr,)
@@ -171,7 +198,15 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, metadata 
 	}
 
 	responseConn := &serverConn{
-		ExtendedConn: bufio.NewExtendedConn(conn), 
+		ExtendedConn: bufio.NewCounterConn(bufio.NewExtendedConn(conn), []N.CountFunc{
+			func(n int64) {
+				poolun.uplink.Add(n)
+			},
+		}, []N.CountFunc{
+			func(n int64) {
+				poolun.downlink.Add(n)
+			},
+		}) , 
 		writer: bufio.NewVectorisedWriter(conn),
 		counterclose: func ()  {
 			ipunitt.count.Add(-1)
