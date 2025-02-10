@@ -19,26 +19,27 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
-func HandleMuxConnection(ctx context.Context, conn net.Conn, handler Handler) error {
+func HandleMuxConnection(ctx context.Context, conn net.Conn, source M.Socksaddr, handler Handler) error {
+	ctx, cancel := context.WithCancelCause(ctx)
 	session := &serverSession{
 		ctx:          ctx,
+		source:       source,
 		conn:         conn,
 		directWriter: bufio.NewExtendedWriter(conn),
 		handler:      handler,
 		streams:      make(map[uint16]*serverStream),
 		writer:       std_bufio.NewWriter(conn),
 	}
-	if ctx.Done() != nil {
-		go func() {
-			<-ctx.Done()
-			session.cleanup(ctx.Err())
-		}()
-	}
-	return session.recvLoop()
+	go func() {
+		<-ctx.Done()
+		session.cleanup(ctx.Err())
+	}()
+	return session.recvLoop(cancel)
 }
 
 type serverSession struct {
 	ctx          context.Context
+	source       M.Socksaddr
 	conn         net.Conn
 	directWriter N.ExtendedWriter
 	handler      Handler
@@ -55,11 +56,11 @@ type serverStream struct {
 	pipe        *io.PipeWriter
 }
 
-func (c *serverSession) recvLoop() error {
+func (c *serverSession) recvLoop(cancel context.CancelCauseFunc) error {
 	for {
 		err := c.recv()
 		if err != nil {
-			c.cleanup(err)
+			cancel(err)
 			return E.Cause(err, "mux connection closed")
 		}
 	}
@@ -136,27 +137,21 @@ func (c *serverSession) recv() error {
 			return E.New("bad network: ", network)
 		}
 		go func() {
-			var hErr error
 			if network == NetworkTCP {
-				hErr = c.handler.NewConnection(c.ctx, &serverMuxConn{
+				conn := &serverMuxConn{
 					sessionID,
 					pipeIn,
 					c,
-				}, M.Metadata{
-					Destination: destination,
-				})
+				}
+				c.handler.NewConnectionEx(c.ctx, conn, c.source, destination, nil)
 			} else {
-				hErr = c.handler.NewPacketConnection(c.ctx, &serverMuxPacketConn{
+				conn := &serverMuxPacketConn{
 					sessionID,
 					pipeIn,
 					c,
 					destination,
-				}, M.Metadata{
-					Destination: destination,
-				})
-			}
-			if hErr != nil {
-				c.handler.NewError(c.ctx, hErr)
+				}
+				c.handler.NewPacketConnectionEx(c.ctx, conn, c.source, destination, nil)
 			}
 		}()
 	case StatusKeep:
