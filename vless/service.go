@@ -29,6 +29,7 @@ type Service[T comparable] struct {
 	logger   logger.Logger
 	handler  Handler
 	userMapsync *sync.Map
+
 }
 
 type UserStatus struct {
@@ -61,7 +62,7 @@ func (s *Service[T]) Adduser(uuid uuid.UUID, loginlimit int, bandwidth int, user
 	s.userMapsync.Store(uuid, UserUnit[T]{
 		user: user,
 		pool: &poolUnit{
-			ipmap: make(map[netip.Addr]*ipunit, loginlimit),
+			ipmap: make(map[netip.Addr]*sAtomic.Int64, loginlimit),
 			maxlogin: loginlimit,
 			poolaccsess: &sync.RWMutex{},
 			downlink: new(sAtomic.Int64),
@@ -126,8 +127,8 @@ func (s *Service[T]) getipmap(userunit UserUnit[T]) map[netip.Addr]int64 {
 	tmpmap := map[netip.Addr]int64{}
 
 	userunit.pool.poolaccsess.RLock()
-	for ip, ipunit := range userunit.pool.ipmap {
-		tmpmap[ip] = ipunit.count.Load()
+	for ip, counter := range userunit.pool.ipmap {
+		tmpmap[ip] = counter.Load()
 	}
 	userunit.pool.poolaccsess.RUnlock()
 	return tmpmap
@@ -158,7 +159,7 @@ func (s *Service[T]) RemoveUser(uuid uuid.UUID) (UserStatus, error) {
 
 type poolUnit struct {
 	//ippmap sync.Map
-	ipmap map[netip.Addr]*ipunit //TODO: use sync.Map instead of mutex
+	ipmap map[netip.Addr]*sAtomic.Int64 //TODO: use sync.Map instead of mutex
 	maxlogin int
 	poolaccsess *sync.RWMutex
 	downlink *sAtomic.Int64
@@ -176,12 +177,6 @@ type poolUnit struct {
 type JustCloser interface {
 	JustClose() error
 }
-
-type ipunit struct {
-	count *sAtomic.Int64
-}
-
-
 type Handler interface {
 	N.TCPConnectionHandlerEx
 	N.UDPConnectionHandlerEx
@@ -194,20 +189,16 @@ func NewService[T comparable](logger logger.Logger, handler Handler) *Service[T]
 	}
 }
 
+const GBTOBYTE = 1024 * 1024 * 1024 
+
 func (s *Service[T]) UpdateUsers(userList []T, userUUIDList []string, userFlowList []string) {
 	userMap := make(map[[16]byte]T)
 	userFlowMap := make(map[T]string)
-	for i, userName := range userList {
-		userID := uuid.FromStringOrNil(userUUIDList[i])
-		if userID == uuid.Nil {
-			userID = uuid.NewV5(uuid.Nil, userUUIDList[i])
-		}
-		userMap[userID] = userName
-		userFlowMap[userName] = userFlowList[i]
-	}
+	s.userMapsync = &sync.Map{}
+	//for i, userName := range userList {}
 	s.userMap = userMap
 	s.userFlow = userFlowMap
-	s.userMapsync = &sync.Map{}
+	
 }
 
 func (s *Service[T]) NewConnectionDep(ctx context.Context, conn net.Conn, source M.Socksaddr, onClose N.CloseHandlerFunc) error {
@@ -277,20 +268,20 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 		s.logger.Info("bancdwidth limit hit ", "user ")
 		return E.New("Bandwidth limititation hit closing connections")
 	}
-	ipunitt, loaded := poolun.ipmap[source.Addr]
+	counter, loaded := poolun.ipmap[source.Addr]
 	poolun.poolaccsess.RUnlock()
 	
 
-	
 	if !loaded && len(poolun.ipmap) >= poolun.maxlogin {
 		return E.New("ip pool already filled new connection from diffrent ips rejected ", source.Addr.String(), string(request.UUID[:16]), )
 	} else if !loaded {
-		ipunitt = &ipunit{
-			count: new(sAtomic.Int64),
-		}
 		poolun.poolaccsess.Lock()
-		poolun.ipmap[source.Addr] = ipunitt
-		poolun.poolaccsess.Unlock()		
+		counter, loaded = poolun.ipmap[source.Addr] //linier checking which mean counter won't replace
+		if !loaded {
+			counter = new(sAtomic.Int64)
+			poolun.ipmap[source.Addr] = counter
+		}
+		poolun.poolaccsess.Unlock()
 	}
 	// s.botlog <- "user conn from " + string(request.UUID[:16])
 
@@ -335,18 +326,18 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 
 	oncloser := func (err error)  {
 
-		if (poolun.downlink.Load())>= int64(poolun.bandwidthlimit) && !poolun.bandwidthlimiterdisabled{
+		if (poolun.downlink.Load())>= int64(poolun.bandwidthlimit) && !poolun.bandwidthlimiterdisabled {
 			poolun.poolaccsess.Lock()
 			for _, close := range poolun.connections {
 				close.JustClose()
 			}
 			poolun.disabled = true
-			poolun.ipmap = map[netip.Addr]*ipunit{}
+			poolun.ipmap = map[netip.Addr]*sAtomic.Int64{}
 			poolun.poolaccsess.Unlock()
 			return
 		}
 	
-		if ipunitt.count.Add(-1) <= 2 { // remove the ip addr from map only when 2 or less connection left
+		if counter.Add(-1) <= 2  { // remove the ip addr from map only when 2 or less connection left
 			poolun.poolaccsess.Lock()
 			delete(poolun.ipmap, source.Addr)
 			poolun.poolaccsess.Unlock()
@@ -379,14 +370,14 @@ func (s *Service[T]) NewConnection(ctx context.Context, conn net.Conn, source M.
 	
 	switch request.Command {
 	case vmess.CommandTCP:
-		ipunitt.count.Add(1)
+		counter.Add(1)
 		s.handler.NewConnectionEx(ctx, conn, source, request.Destination, N.AppendClose(onClose, oncloser))
 		return nil
 		
 	case vmess.CommandMux:
-		ipunitt.count.Add(1)
+		counter.Add(1)
 		err = vmess.HandleMuxConnection(ctx, conn, source, s.handler)
-		ipunitt.count.Add(-1)
+		counter.Add(-1)
 		return err
 		
 	default:
